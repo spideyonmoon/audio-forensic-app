@@ -396,7 +396,7 @@ private fun DynamicsTab(report: ForensicReport) {
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 LoudnessPill("LUFS Integrated", loud.lufs_integrated.ifEmpty { "-8.89 LUFS" }, CyanAccent)
-                LoudnessPill("Loudness Range", loud.lufs_range.ifEmpty { "9.86 LU" }, PurpleAccent)
+                LoudnessPill("Loudness Range", loud.lufs_range.ifEmpty { "9.86 LU" }, Color(0xFFB388FF))
                 LoudnessPill("True Peak", loud.true_peak_dbtp.ifEmpty { "-0.09 dBTP" }, Color(0xFFFFB74D))
             }
         }

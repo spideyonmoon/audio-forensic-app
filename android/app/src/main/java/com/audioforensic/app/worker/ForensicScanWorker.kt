@@ -22,8 +22,8 @@ class ForensicScanWorker(
                 // Report progress
             }
             Result.success(workDataOf(
-                "SCORE" to (report.authenticity?.main_score ?: 0),
-                "VERDICT" to (report.authenticity?.verdict_label ?: "UNKNOWN")
+                "SCORE" to report.mainScore,
+                "VERDICT" to report.verdictLabel
             ))
         } catch (e: Exception) {
             Result.failure(workDataOf("ERROR" to (e.message ?: "Analysis failed")))
