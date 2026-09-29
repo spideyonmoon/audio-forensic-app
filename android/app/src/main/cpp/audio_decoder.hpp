@@ -23,6 +23,7 @@ struct DecodedAudio {
     std::vector<float> mid;
     std::vector<float> side; // empty if mono
     std::vector<int32_t> raw_i32_stereo; // for bit depth / MQA analysis
+    std::vector<float> interleaved;
 };
 
 inline bool decodeAudioFile(const std::string& path, DecodedAudio& out, double max_seconds = 0.0) {
@@ -131,7 +132,7 @@ inline bool decodeAudioFile(const std::string& path, DecodedAudio& out, double m
         out.raw_i32_stereo[i * 2 + 0] = static_cast<int32_t>(std::clamp(l, -1.0f, 1.0f) * 2147483647.0f);
         out.raw_i32_stereo[i * 2 + 1] = static_cast<int32_t>(std::clamp(r, -1.0f, 1.0f) * 2147483647.0f);
     }
-
+    out.interleaved = std::move(interleaved);
     return true;
 }
 

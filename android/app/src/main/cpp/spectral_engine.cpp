@@ -1,4 +1,6 @@
 #include "spectral_engine.hpp"
+#include "metadata_extractor.hpp"
+#include "acoustic_analyzer.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -6,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <chrono>
+#include <filesystem>
 
 namespace audio_forensic {
 
@@ -370,66 +373,212 @@ double SpectralEngine::mdctQuantError(const float* audio, size_t len, const floa
     if (sample_rate_ != 44100 && sample_rate_ != 48000) return -1.0;
     const size_t N2 = 2048;
     const size_t N = 1024;
-    if (len < N2 * 4) return -1.0;
+
+    // gamma(K): truncated-normal on [0, inf) quantile so genuine P(E < gamma) = P = 0.01
+    // E = sum of K squared-uniform errors -> mean K/12, var K/180 by CLT.
+    const double P_prob = 0.01;
+    double gam[49];
+    for (int b = 0; b < 49; ++b) {
+        double K = static_cast<double>(SWB_LONG_44_48[b + 1] - SWB_LONG_44_48[b]);
+        double mu = K / 12.0;
+        double sigma = std::sqrt(K / 180.0);
+        double lo = ndtr(-mu / sigma);
+        gam[b] = mu + sigma * ndtri(P_prob + (1.0 - P_prob) * lo);
+    }
+
+    size_t cap_n = std::min(len, static_cast<size_t>(180.0 * sample_rate_));
+    if (cap_n < N2 * 4) return -1.0;
+
+    std::vector<const float*> channels = { audio };
+    if (side != nullptr && side_len >= N2 * 4) {
+        channels.push_back(side);
+    }
 
     auto win = kbdWindow(N2, 4.0);
-    // Find active anchor windows with high energy
-    size_t hop = 512;
-    size_t n_pos = (len - N2) / hop;
-    std::vector<size_t> anchors;
-    for (size_t i = 0; i < n_pos; ++i) {
-        size_t pos = i * hop;
-        double sum_sq = 0.0;
-        for (size_t j = 0; j < N2; ++j) {
-            double v = audio[pos + j] * 32768.0;
-            sum_sq += v * v;
+    const size_t n_anchors_target = 16;
+    const size_t n_sf = 8;
+    const size_t phase_step = 8;
+    const size_t n_phases = N / phase_step; // 128 phases
+
+    double bestL = -1.0;
+
+    for (const float* src : channels) {
+        size_t n_sig = cap_n;
+        size_t hop = N;
+        if (n_sig < N2) continue;
+        size_t npos = (n_sig - N2) / hop;
+        if (npos < 2) continue;
+
+        // Cumulative energy of sig
+        std::vector<double> csq(n_sig + 1, 0.0);
+        for (size_t i = 0; i < n_sig; ++i) {
+            double v = static_cast<double>(src[i]) * 32768.0;
+            csq[i + 1] = csq[i] + v * v;
         }
-        if (sum_sq > N2 * 100.0) {
-            anchors.push_back(pos);
-            if (anchors.size() >= 12) break;
+
+        std::vector<std::pair<double, size_t>> eblk;
+        eblk.reserve(npos);
+        double max_eblk = 0.0;
+        for (size_t i = 0; i < npos; ++i) {
+            size_t start = i * hop;
+            double energy = csq[start + N2] - csq[start];
+            eblk.push_back({ energy, i });
+            if (energy > max_eblk) max_eblk = energy;
         }
-    }
-    if (anchors.size() < 4) return -1.0;
 
-    double max_score = 0.0;
-    // Test long window AAC scalefactor bands
-    for (size_t pos : anchors) {
-        std::vector<double> block(N2);
-        for (size_t j = 0; j < N2; ++j) block[j] = audio[pos + j] * 32768.0 * win[j];
+        std::sort(eblk.begin(), eblk.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+        });
 
-        // Princen-Bradley time-domain aliasing fold
-        std::vector<double> folded(N);
-        for (size_t i = 0; i < N / 2; ++i) {
-            folded[i] = -block[N + N / 2 - 1 - i] - block[N + N / 2 + i];
-            folded[N / 2 + i] = block[i] - block[N / 2 - 1 - i];
-        }
-        auto X = dctIV(folded);
+        double energy_floor = std::max(static_cast<double>(N2) * 100.0, max_eblk * 1e-6);
+        std::vector<size_t> anchors;
+        for (const auto& item : eblk) {
+            if (item.first < energy_floor) break;
+            size_t pos = item.second * hop;
+            if (pos < N / 2) continue;
+            size_t base = pos - N / 2;
+            if (base + (N - 1) + N2 > n_sig) continue;
 
-        // Check power-law integer rounding
-        int bands_supported = 0;
-        for (int b = 0; b < 49; ++b) {
-            int start = SWB_LONG_44_48[b];
-            int end = SWB_LONG_44_48[b + 1];
-            double max_b = 0.0;
-            for (int k = start; k < end; ++k) max_b = std::max(max_b, std::abs(X[k]));
-            if (max_b < 1.0) continue;
-
-            double sdz = 16.0 + (4.0 / 3.0) * (std::log(max_b) / std::log(2.0));
-            double s_band = 0.5 * sdz;
-            double scale = std::pow(2.0, -3.0 * s_band / 16.0);
-
-            double err_sum = 0.0;
-            for (int k = start; k < end; ++k) {
-                double xp = std::pow(std::abs(X[k]), 0.75) * scale;
-                double eps = std::round(xp) - xp;
-                err_sum += eps * eps;
+            bool far_enough = true;
+            for (size_t p : anchors) {
+                if (pos > p ? (pos - p <= N2) : (p - pos <= N2)) {
+                    far_enough = false;
+                    break;
+                }
             }
-            if (err_sum / (end - start) < 0.1) bands_supported++;
+            if (far_enough) {
+                anchors.push_back(pos);
+                if (anchors.size() >= n_anchors_target) break;
+            }
         }
-        double frac = static_cast<double>(bands_supported) / 49.0;
-        max_score = std::max(max_score, frac);
+
+        if (anchors.size() < 4) continue;
+
+        size_t num_anchors = anchors.size();
+        size_t total_frames = num_anchors * n_phases;
+
+        // Preallocate and compute MDCT for all (anchor, phase) frames
+        std::vector<std::vector<double>> X_all(total_frames, std::vector<double>(N));
+        std::vector<std::vector<double>> Xp_all(total_frames, std::vector<double>(N));
+        std::vector<std::vector<double>> band_power(total_frames, std::vector<double>(49));
+        std::vector<std::vector<bool>> energetic(total_frames, std::vector<bool>(49, false));
+        std::vector<std::vector<double>> smin(total_frames, std::vector<double>(49));
+        std::vector<std::vector<double>> smax(total_frames, std::vector<double>(49));
+
+        for (size_t ai = 0; ai < num_anchors; ++ai) {
+            size_t a = anchors[ai];
+            size_t base = a - N / 2;
+            for (size_t pi = 0; pi < n_phases; ++pi) {
+                size_t phi = pi * phase_step;
+                size_t frame_idx = ai * n_phases + pi;
+                size_t offset = base + phi;
+
+                // Windowed input block
+                std::vector<double> block(N2);
+                for (size_t j = 0; j < N2; ++j) {
+                    block[j] = static_cast<double>(src[offset + j]) * 32768.0 * win[j];
+                }
+
+                // Princen-Bradley time-domain aliasing fold
+                // folded = [-c[::-1] - d, a - b[::-1]]
+                std::vector<double> folded(N);
+                for (size_t i = 0; i < 512; ++i) {
+                    folded[i] = -block[1535 - i] - block[1536 + i];
+                }
+                for (size_t j = 0; j < 512; ++j) {
+                    folded[512 + j] = block[j] - block[1023 - j];
+                }
+
+                // Orthonormal DCT-IV
+                auto X = dctIV(folded);
+                double max_bp = 0.0;
+                for (size_t k = 0; k < N; ++k) {
+                    double abs_xk = std::abs(X[k]);
+                    X_all[frame_idx][k] = abs_xk;
+                    Xp_all[frame_idx][k] = std::pow(abs_xk, 0.75);
+                }
+
+                for (int b = 0; b < 49; ++b) {
+                    int start = SWB_LONG_44_48[b];
+                    int end = SWB_LONG_44_48[b + 1];
+                    double K = static_cast<double>(end - start);
+                    double sum_sq = 0.0;
+                    double max_b = 1e-12;
+                    for (int k = start; k < end; ++k) {
+                        double v = X_all[frame_idx][k];
+                        sum_sq += v * v;
+                        if (v > max_b) max_b = v;
+                    }
+                    double bp = sum_sq / K;
+                    band_power[frame_idx][b] = bp;
+                    if (bp > max_bp) max_bp = bp;
+
+                    double sdz = 16.0 + (4.0 / 3.0) * (std::log(max_b) / std::log(2.0));
+                    smin[frame_idx][b] = 0.3 * sdz;
+                    smax[frame_idx][b] = 0.7 * sdz;
+                }
+
+                double pwr_threshold = std::max(1.0, max_bp * 1e-6);
+                for (int b = 0; b < 49; ++b) {
+                    energetic[frame_idx][b] = (band_power[frame_idx][b] > pwr_threshold);
+                }
+            }
+        }
+
+        // Test scalefactor fractions and accumulate per phase
+        for (size_t i_sf = 0; i_sf < n_sf; ++i_sf) {
+            double frac = (n_sf > 1) ? (static_cast<double>(i_sf) / static_cast<double>(n_sf - 1)) : 0.0;
+            std::vector<double> c_frame(total_frames, 0.0);
+
+            for (size_t frame_idx = 0; frame_idx < total_frames; ++frame_idx) {
+                int eligible_count = 0;
+                int flagged_count = 0;
+
+                for (int b = 0; b < 49; ++b) {
+                    int start = SWB_LONG_44_48[b];
+                    int end = SWB_LONG_44_48[b + 1];
+                    double K = static_cast<double>(end - start);
+                    double s_band = smin[frame_idx][b] + frac * (smax[frame_idx][b] - smin[frame_idx][b]);
+                    double scale_bin = std::pow(2.0, -3.0 * s_band / 16.0);
+
+                    double eps_sum = 0.0;
+                    int ge_half = 0;
+                    for (int k = start; k < end; ++k) {
+                        double xsc = Xp_all[frame_idx][k] * scale_bin;
+                        double eps = std::round(xsc) - xsc;
+                        eps_sum += eps * eps;
+                        if (xsc >= 0.5) ge_half++;
+                    }
+
+                    bool populated = (static_cast<double>(ge_half) >= K * 0.5);
+                    bool elig = energetic[frame_idx][b] && populated;
+                    if (elig) {
+                        eligible_count++;
+                        if (eps_sum < gam[b]) {
+                            flagged_count++;
+                        }
+                    }
+                }
+
+                if (eligible_count >= 16) {
+                    c_frame[frame_idx] = static_cast<double>(flagged_count) / 49.0;
+                } else {
+                    c_frame[frame_idx] = 0.0;
+                }
+            }
+
+            // Average c across all anchors for each phase
+            for (size_t pi = 0; pi < n_phases; ++pi) {
+                double sum_phase = 0.0;
+                for (size_t ai = 0; ai < num_anchors; ++ai) {
+                    sum_phase += c_frame[ai * n_phases + pi];
+                }
+                double avg_phase = sum_phase / static_cast<double>(num_anchors);
+                if (avg_phase > bestL) bestL = avg_phase;
+            }
+        }
     }
-    return max_score;
+    return bestL;
 }
 
 void SpectralEngine::vorbisGrid(const float* mid, size_t len, const float* side, size_t side_len,
@@ -452,6 +601,32 @@ void SpectralEngine::vorbisGrid(const float* mid, size_t len, const float* side,
     score = 0.0;
     tested = 12;
     channel = (side && side_len > 0) ? "L/R" : "M";
+}
+
+double SpectralEngine::spectralEntropy(const std::vector<std::vector<double>>& frames) const {
+    if (frames.empty() || frames[0].empty()) return 0.0;
+    size_t n_frames = frames.size();
+    size_t n_bins = frames[0].size();
+    std::vector<double> avg(n_bins, 0.0);
+    for (size_t i = 0; i < n_frames; ++i) {
+        for (size_t j = 0; j < n_bins; ++j) {
+            avg[j] += frames[i][j];
+        }
+    }
+    double total = 0.0;
+    for (size_t j = 0; j < n_bins; ++j) {
+        avg[j] /= n_frames;
+        total += avg[j];
+    }
+    if (total <= 1e-12) return 0.0;
+    double ent = 0.0;
+    for (size_t j = 0; j < n_bins; ++j) {
+        double p = avg[j] / total;
+        if (p > 1e-15) {
+            ent -= p * std::log2(p);
+        }
+    }
+    return ent;
 }
 
 SpectralAnalysis SpectralEngine::analyse(const float* mid_data, size_t mid_len,
@@ -558,10 +733,29 @@ SpectralAnalysis SpectralEngine::analyse(const float* mid_data, size_t mid_len,
         }
     }
 
-    // Natural credits
+    double ent = spectralEntropy(mags);
+    res.entropy = ent;
+    res.cutoff_variance = cutoff_var;
+
+    // Natural indicators matching Python 11-rule analysis:
+    if (nf > -50.0) {
+        res.natural_evidence.push_back("Preserved Noise Floor: Presence of natural dither or analog hiss above the primary frequency ceiling.");
+    }
+    if (ent > 8.5 && cutoff_hz > nyquist_ * 0.85) {
+        res.natural_evidence.push_back("Spectral Complexity: High entropy score indicates dense, unpredictable signal data devoid of aggressive compression.");
+    }
+    if (sh < 5.0) {
+        res.natural_evidence.push_back("Organic Frequency Rolloff: Gradual attenuation consistent with natural acoustic decay or analog mastering.");
+    }
+    if (cutoff_var > 10000.0 && cutoff_hz > nyquist_ * 0.85) {
+        res.natural_evidence.push_back("Dynamic Cutoff Variance: Frequency ceiling fluctuates organically, typical of uncompressed analog-to-digital transfers.");
+    }
+    if (sa < 0.2) {
+        res.natural_evidence.push_back("Phase & Stereo Integrity: Wide, complex side-channel information preserved without joint-stereo artifacts.");
+    }
+
     if (cutoff_hz > nyquist_ * 0.90 && cd < 10.0 && hf > 0.02) {
         score = std::max(0, score - 30);
-        res.natural_evidence.push_back("Rich Full-Band Extension: Clean organic harmonics to Nyquist");
     }
 
     res.main_score = std::clamp(score, 0, 100);
@@ -593,6 +787,7 @@ ForensicReport analyzeAudio(const std::string& filepath, double max_seconds, con
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
+    // 1. Decode stream
     DecodedAudio audio;
     if (!decodeAudioFile(filepath, audio, max_seconds)) {
         report.authenticity.spectral_cutoff_verdict = "Decode failed or unsupported format";
@@ -604,7 +799,39 @@ ForensicReport analyzeAudio(const std::string& filepath, double max_seconds, con
     report.technical.precision = audio.bit_depth;
     report.technical.duration_sec = audio.duration_sec;
     report.technical.codec = audio.codec_name;
+    report.technical.sample_encoding = std::to_string(audio.bit_depth) + "-bit " + audio.codec_name;
+    report.technical.compression_mode = (audio.codec_name == "MP3") ? "Lossy" : "Lossless";
 
+    // Duration string mm:ss
+    int d_min = static_cast<int>(audio.duration_sec) / 60;
+    int d_sec = static_cast<int>(audio.duration_sec) % 60;
+    std::ostringstream d_ss;
+    d_ss << std::setfill('0') << std::setw(2) << d_min << ":" << std::setw(2) << d_sec;
+    report.technical.duration = d_ss.str();
+
+    // 2. Extract FLAC / audio container metadata tags
+    std::string cover_info;
+    MetadataExtractor::extractFlacMetadata(filepath, report.tags, report.technical, cover_info);
+
+    // Compute file size & bitrate
+    try {
+        namespace fs = std::filesystem;
+        if (fs::exists(filepath)) {
+            report.file_size_mb = static_cast<double>(fs::file_size(filepath)) / (1024.0 * 1024.0);
+            if (report.technical.duration_sec > 0.0) {
+                int kbps = static_cast<int>((report.file_size_mb * 8.0 * 1024.0) / report.technical.duration_sec);
+                report.technical.bit_rate = std::to_string(kbps) + " kbps";
+            }
+        }
+    } catch (...) {}
+
+    // 3. Acoustic & Loudness & Bit-Depth Measurements
+    BitDepthProfile bdp;
+    AcousticAnalyzer::analyze(audio.interleaved.data(), audio.interleaved.size(),
+                             audio.channels, audio.sample_rate, audio.bit_depth,
+                             report.loudness, report.stats, bdp, report.authenticity, report.dr_score);
+
+    // 4. Spectral & Forensic Authenticity Analysis
     SpectralEngine engine(audio.sample_rate, audio.channels, audio.duration_sec, 0, audio.codec_name);
     auto spectral = engine.analyse(audio.mid.data(), audio.mid.size(),
                                   audio.side.empty() ? nullptr : audio.side.data(), audio.side.size(),

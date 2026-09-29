@@ -57,6 +57,7 @@ public:
     double bandingScore(const std::vector<std::vector<double>>& frames, const std::vector<double>& bins, double cutoff_hz, double scan_hz = 1500.0) const;
     double noiseFloorAboveCutoff(const std::vector<std::vector<double>>& frames, const std::vector<double>& bins, double cutoff_hz) const;
     double sideChannelAnomaly(const std::vector<std::vector<double>>& mid_frames, const float* side, size_t side_len, const std::vector<double>& bins) const;
+    double spectralEntropy(const std::vector<std::vector<double>>& frames) const;
 
     void aucdtectFeatures(const std::vector<std::vector<double>>& frames,
                          const std::vector<std::vector<double>>& phase_hi,

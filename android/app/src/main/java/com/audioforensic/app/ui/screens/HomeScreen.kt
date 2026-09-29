@@ -194,7 +194,7 @@ fun HomeScreen(
                 }
             } else {
                 items(recentReports) { report ->
-                    val score = report.authenticity?.main_score ?: 0
+                    val score = report.mainScore
                     val scoreColor = getScoreColor(score)
 
                     Card(
